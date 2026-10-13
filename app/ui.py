@@ -139,6 +139,16 @@ class NavItem(tk.Frame):
         self._active = active
         self._paint(SIDEBAR_ACTIVE if active else SIDEBAR_BG, "#ffffff" if active else SIDEBAR_MUTED)
 
+    def set_badge_visible(self, visible: bool) -> None:
+        """数字为 0 时把徽标收起来，避免留一个空色块。"""
+        if self.badge is None:
+            return
+        showing = bool(self.badge.winfo_manager())
+        if visible and not showing:
+            self.badge.pack(side="right")
+        elif not visible and showing:
+            self.badge.pack_forget()
+
 
 class FlowBar(tk.Frame):
     """会折行的横向容器：窗口变窄时把内容自动排到下一行，不会把按钮挤掉。"""
@@ -393,6 +403,7 @@ class FlashcardApp(tk.Tk):
         self.reload_cards()
         self.stats_var.set(f"今日到期 {self.stats['due']} 张（新卡 {self.stats['new']}）· 共 {self.stats['total']} 张")
         self.due_badge_var.set(str(self.stats["due"]) if self.stats["due"] else "")
+        self.nav_items[0].set_badge_visible(self.stats["due"] > 0)
         self.refresh_ai_status()
         self.cards_tab.reload()
         self.free_tab.reload()
