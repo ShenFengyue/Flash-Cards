@@ -14,6 +14,8 @@ import urllib.request
 
 API_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_TIMEOUT = 60
+# 这些情况说明「模型这次的结果不可用」，值得自动再问一次
+RETRIABLE_OUTPUT_CODES = {"invalid_model_output", "empty_model_output", "truncated_output"}
 
 SYSTEM_PROMPT = """你是「回答匹配度分析器」。你唯一的任务：比较用户对某个社交情境作出的回答，与这道题预先保存的标准回复，判断两者在意思和关键内容上的匹配程度。
 
@@ -85,6 +87,31 @@ def extract_json_text(raw) -> str | None:
     return text[start : end + 1]
 
 
+def parse_model_json(content: str) -> dict | None:
+    """尽量把模型输出解析成 JSON 对象：原文 → 去掉代码块包裹 → 截取最外层大括号。
+    全都失败时返回 None（上层会报错并重试），绝不编造结果。"""
+    text = (content or "").strip()
+    if not text:
+        return None
+    candidates = [text]
+    fenced = extract_json_text(text)
+    if fenced and fenced != text:
+        candidates.append(fenced)
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        sliced = text[start : end + 1]
+        if sliced not in candidates:
+            candidates.append(sliced)
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def _clean_points(value, field: str) -> list[str]:
     if value is None:
         raise AiError("invalid_model_output", f"DeepSeek 返回的分析结果不完整：缺少字段 {field}")
@@ -146,8 +173,39 @@ def analyze(
     timeout: int = DEFAULT_TIMEOUT,
     api_url: str = API_URL,
     opener=urllib.request.urlopen,
+    retries: int = 1,
 ) -> dict:
-    """调用 DeepSeek 并返回经过校验的分析结果；失败抛 AiError。"""
+    """调用 DeepSeek 并返回经过校验的分析结果；失败抛 AiError。
+
+    模型偶尔会返回格式不对或没写完的 JSON。这类「结果不可用」的情况会自动再问一次
+    （最多 retries 次），仍然失败才报错。网络、密钥、超时等问题不会重试。
+    """
+    last_error: AiError | None = None
+    for attempt in range(retries + 1):
+        try:
+            return _analyze_once(
+                front, back, user_answer, api_key,
+                model=model, thinking=thinking, timeout=timeout, api_url=api_url, opener=opener,
+            )
+        except AiError as error:
+            last_error = error
+            if error.code not in RETRIABLE_OUTPUT_CODES or attempt >= retries:
+                raise
+    raise last_error  # pragma: no cover - 循环里必定已经 return 或 raise
+
+
+def _analyze_once(
+    front: str,
+    back: str,
+    user_answer: str,
+    api_key: str,
+    model: str = "deepseek-flash",
+    thinking: str = "disabled",
+    timeout: int = DEFAULT_TIMEOUT,
+    api_url: str = API_URL,
+    opener=urllib.request.urlopen,
+) -> dict:
+    """真正发一次请求。"""
     answer = (user_answer or "").strip()
     if not (front or "").strip():
         raise AiError("bad_request", "缺少卡片正面内容", retriable=False)
@@ -158,7 +216,7 @@ def analyze(
     if not api_key:
         raise AiError(
             "not_configured",
-            "尚未配置 DeepSeek API 密钥：点击右上角「API 设置」填写，或设置系统环境变量 DEEPSEEK_API_KEY。",
+            "尚未配置 DeepSeek API 密钥：点左侧边栏下方的「API 设置」填写，或设置系统环境变量 DEEPSEEK_API_KEY。",
             retriable=False,
         )
 
@@ -167,7 +225,7 @@ def analyze(
         "messages": build_messages(front, back, answer),
         "response_format": {"type": "json_object"},
         "temperature": 0.2,
-        "max_tokens": 1200,
+        "max_tokens": 2000,
         "thinking": {"type": "enabled" if thinking == "enabled" else "disabled"},
         "stream": False,
     }
@@ -215,18 +273,16 @@ def analyze(
     content = None
     if choices:
         content = (choices[0].get("message") or {}).get("content")
+    finish_reason = choices[0].get("finish_reason") if choices else None
+    if finish_reason == "length":
+        raise AiError("truncated_output", "DeepSeek 这次返回的内容被截断了，正在重试。")
     if not isinstance(content, str) or not content.strip():
-        finish_reason = choices[0].get("finish_reason") if choices else None
         suffix = f"（finish_reason={finish_reason}）" if finish_reason else ""
         raise AiError("empty_model_output", f"DeepSeek 没有返回可用的分析内容{suffix}。")
 
-    json_text = extract_json_text(content)
-    if not json_text:
-        raise AiError("invalid_model_output", "DeepSeek 返回的内容里没有可解析的 JSON 对象。")
-    try:
-        parsed_content = json.loads(json_text)
-    except json.JSONDecodeError as error:
-        raise AiError("invalid_model_output", f"DeepSeek 返回的 JSON 无法解析：{error}") from error
+    parsed_content = parse_model_json(content)
+    if parsed_content is None:
+        raise AiError("invalid_model_output", "DeepSeek 这次返回的 JSON 格式不对，正在重试。")
 
     result = validate_analysis(parsed_content)
     usage = body.get("usage") or {}

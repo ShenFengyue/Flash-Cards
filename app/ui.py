@@ -224,6 +224,9 @@ class FlashcardApp(tk.Tk):
         self._setup_style()
         self._build_shell()
 
+        # tkinter 默认会把界面回调里的异常悄悄吞掉（.pyw 没有控制台，看不到任何提示），
+        # 这里改成写日志 + 弹窗，避免出现「点了没反应」却查不到原因的情况。
+        self.report_callback_exception = self._report_callback_exception
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_all()
         self.review_tab.ensure_queue()
@@ -435,6 +438,21 @@ class FlashcardApp(tk.Tk):
 
     def save_drafts(self) -> None:
         paths.save_drafts(self.drafts)
+
+    def _report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        import traceback
+
+        detail = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        try:
+            paths.ensure_data_dir()
+            with open(paths.DATA_DIR / "last_error.log", "a", encoding="utf-8") as handle:
+                handle.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} ===\n{detail}")
+        except OSError:
+            pass
+        try:
+            messagebox.showerror(APP_NAME, f"刚才的操作出错了，已记录到 data\\last_error.log：\n\n{exc_value}", parent=self)
+        except tk.TclError:
+            pass
 
     def on_close(self) -> None:
         self.free_tab.panel.persist_draft()
@@ -862,22 +880,32 @@ class PracticePanel(tk.Frame):
             return ai.analyze(card["front"], card["back"], answer, api_key, model=model, thinking=thinking)
 
         def ok(outcome):
-            attempt = self.session.attach_result(attempt_id, outcome)
-            self.attempt = attempt
-            self.analysis = outcome["analysis"]
-            self.grade = self.session.grade_for(self.analysis)
-            self.phase = "result"
-            self._render_result()
-            self._render_confirm()
-            self._show_result_area(True)
-            self._refresh_actions()
-            self._set_banner("")
-            self.app.drafts.pop(f"{self.mode}:{self.card['id']}", None)
-            self.app.save_drafts()
+            # 任何意外都不能把界面卡在「正在对比」状态：出错也要把状态切回来并说清楚
+            try:
+                attempt = self.session.attach_result(attempt_id, outcome)
+                self.attempt = attempt
+                self.analysis = outcome["analysis"]
+                self.grade = self.session.grade_for(self.analysis)
+                self.phase = "result"
+                self._render_result()
+                self._render_confirm()
+                self._show_result_area(True)
+                self._refresh_actions()
+                self._set_banner("")
+                self.app.drafts.pop(f"{self.mode}:{self.card['id']}", None)
+                self.app.save_drafts()
+            except Exception as error:  # noqa: BLE001
+                self.session.attach_error(attempt_id, f"结果保存失败：{error}")
+                self.phase = "error"
+                self._refresh_actions()
+                self._set_banner(f"拿到了分析结果但保存失败：{error}", "error")
 
         def fail(error):
             message = error.message if isinstance(error, ai.AiError) else str(error)
-            self.session.attach_error(attempt_id, message)
+            try:
+                self.session.attach_error(attempt_id, message)
+            except Exception as db_error:  # noqa: BLE001
+                message = f"{message}（另外，失败原因也没能保存：{db_error}）"
             self.phase = "error"
             self._refresh_actions()
             self._set_banner(f"分析失败：{message}", "error")
@@ -1806,8 +1834,56 @@ class ImportDialog(tk.Toplevel):
         self.destroy()
 
 
+INSTANCE_LOCK_PORT = 51788
+
+
+def _acquire_single_instance():
+    """用本地端口当锁：程序已经在运行时，不再让第二个窗口同时打开数据库。"""
+    import socket
+
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", INSTANCE_LOCK_PORT))
+        lock.listen(1)
+    except OSError:
+        lock.close()
+        return None
+    return lock
+
+
+def _focus_existing_window() -> None:
+    """把已经打开的窗口切到最前面，并提示一句。"""
+    hwnd = 0
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, f"{APP_NAME} {APP_VERSION}")
+        except Exception:  # noqa: BLE001
+            hwnd = 0
+    if hwnd:
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showinfo(APP_NAME, "程序已经在运行了，窗口应该在任务栏里。")
+    root.destroy()
+
+
 def main() -> None:
     paths.ensure_data_dir()
+    instance_lock = _acquire_single_instance()
+    if instance_lock is None:
+        _focus_existing_window()
+        return
     db = Database(paths.DB_PATH)
     db.initialize()
     db.seed_if_needed(SEED_CARDS)
@@ -1817,3 +1893,4 @@ def main() -> None:
         app.mainloop()
     finally:
         db.close()
+        instance_lock.close()

@@ -94,6 +94,82 @@ class ValidateAnalysisTest(unittest.TestCase):
         self.assertIsNone(ai.extract_json_text("没有 JSON"))
         self.assertIsNone(ai.extract_json_text(None))
 
+    def test_parse_model_json_tolerates_common_shapes(self):
+        self.assertEqual(ai.parse_model_json(json.dumps(VALID)), VALID)
+        self.assertEqual(ai.parse_model_json("```json\n" + json.dumps(VALID) + "\n```"), VALID)
+        self.assertEqual(ai.parse_model_json("这是结果：" + json.dumps(VALID) + " 以上"), VALID)
+        self.assertIsNone(ai.parse_model_json("完全没有 JSON"))
+        self.assertIsNone(ai.parse_model_json('{"match_score": 80,}'))
+        self.assertIsNone(ai.parse_model_json(None))
+
+
+class RetryOnBrokenOutputTest(unittest.TestCase):
+    """模型偶尔会返回格式不对的 JSON，这类情况应当自动再问一次，而不是直接失败。"""
+
+    def test_retries_once_then_succeeds(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(request)
+            if len(calls) == 1:
+                return FakeResponse(body_for('{"match_score": 88, "matched_points": ['))
+            return FakeResponse(body_for(json.dumps(VALID, ensure_ascii=False)))
+
+        outcome = ai.analyze("正面", "标准回复", "我的回答", "key", opener=opener)
+        self.assertEqual(outcome["analysis"]["match_score"], 78)
+        self.assertEqual(len(calls), 2)
+
+    def test_gives_up_after_retries_and_never_fabricates_a_score(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(request)
+            return FakeResponse(body_for("这不是 JSON"))
+
+        with self.assertRaises(ai.AiError) as context:
+            ai.analyze("正面", "标准回复", "我的回答", "key", opener=opener)
+        self.assertEqual(context.exception.code, "invalid_model_output")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("match_score", str(context.exception))
+
+    def test_truncated_output_is_retried(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(request)
+            if len(calls) == 1:
+                return FakeResponse(json.dumps({"choices": [{"message": {"content": '{"match_score": 5'}, "finish_reason": "length"}]}))
+            return FakeResponse(body_for(json.dumps(VALID, ensure_ascii=False)))
+
+        outcome = ai.analyze("正面", "标准回复", "我的回答", "key", opener=opener)
+        self.assertEqual(outcome["analysis"]["match_score"], 78)
+        self.assertEqual(len(calls), 2)
+
+    def test_authorization_failure_is_not_retried(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(request)
+            payload = json.dumps({"error": {"message": "Invalid token"}}).encode("utf-8")
+            raise urllib.error.HTTPError(ai.API_URL, 401, "Unauthorized", {}, io.BytesIO(payload))
+
+        with self.assertRaises(ai.AiError) as context:
+            ai.analyze("正面", "标准回复", "我的回答", "key", opener=opener)
+        self.assertEqual(context.exception.code, "unauthorized")
+        self.assertEqual(len(calls), 1)
+
+    def test_network_failure_is_not_retried(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(request)
+            raise urllib.error.URLError("getaddrinfo failed")
+
+        with self.assertRaises(ai.AiError) as context:
+            ai.analyze("正面", "标准回复", "我的回答", "key", opener=opener)
+        self.assertEqual(context.exception.code, "network")
+        self.assertEqual(len(calls), 1)
+
 
 class AnalyzeTest(unittest.TestCase):
     def test_missing_key_reports_not_configured_without_calling_network(self):

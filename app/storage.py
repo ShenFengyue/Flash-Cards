@@ -101,6 +101,8 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
+        # 万一同时开了两个窗口，让写入等待而不是立刻失败
+        self.conn.execute("PRAGMA busy_timeout = 10000")
 
     def initialize(self) -> None:
         with self.conn:
