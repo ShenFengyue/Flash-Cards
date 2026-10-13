@@ -34,6 +34,60 @@ def truncate(text: str, length: int = 60) -> str:
     return text if len(text) <= length else text[: length - 1] + "…"
 
 
+class FlowBar(tk.Frame):
+    """会折行的横向容器：窗口变窄时把内容自动排到下一行，不会把按钮挤掉。"""
+
+    GAP = 8
+
+    def __init__(self, parent, **kwargs):
+        kwargs.setdefault("bg", BG)
+        super().__init__(parent, **kwargs)
+        self._visible: list[tk.Widget] = []
+        self._last_width = None
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    def show(self, widgets) -> None:
+        """只显示传入的控件（按传入顺序排列），其余的隐藏。"""
+        self._visible = list(widgets)
+        self._layout(self.winfo_width())
+
+    def hide_all(self) -> None:
+        self.show([])
+
+    def _on_configure(self, event) -> None:
+        if self._last_width != event.width:
+            self._layout(event.width)
+
+    def _layout(self, width: int) -> None:
+        for child in self.winfo_children():
+            child.grid_forget()
+        if not self._visible:
+            return
+
+        available = width if width > 60 else 640
+        row = 0
+        column = 0
+        used = 0
+        for widget in self._visible:
+            need = widget.winfo_reqwidth() + self.GAP
+            if used and used + need > available:
+                row += 1
+                column = 0
+                used = 0
+            widget.grid(row=row, column=column, sticky="w", padx=(0, self.GAP), pady=(0, 6))
+            used += need
+            column += 1
+
+
+def adaptive_wrap(label: tk.Label, container: tk.Misc, padding: int = 40) -> None:
+    """让标签的换行宽度跟着容器宽度走，窗口缩放时文字不会被截断。"""
+
+    def on_configure(event):
+        label.configure(wraplength=max(160, event.width - padding))
+
+    container.bind("<Configure>", on_configure, add="+")
+
+
 class FlashcardApp(tk.Tk):
     """主窗口：顶部状态栏 + 三个页签（今日复习 / 自由练习 / 全部闪卡）。"""
 
@@ -47,7 +101,8 @@ class FlashcardApp(tk.Tk):
 
         self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("1120x760")
-        self.minsize(940, 660)
+        # 允许窗口缩得比较小，布局会自动折行、内部区域自带滚动条
+        self.minsize(720, 520)
         self.configure(bg=BG)
 
         self._setup_style()
@@ -98,19 +153,31 @@ class FlashcardApp(tk.Tk):
 
         inner = tk.Frame(header, bg=CARD_BG)
         inner.pack(fill="x", padx=16, pady=10)
+        inner.columnconfigure(0, weight=1)
 
-        tk.Label(inner, text=APP_NAME, bg=CARD_BG, fg=TEXT, font=(FONT, 15, "bold")).pack(side="left")
-        tk.Label(inner, text=f"  v{APP_VERSION}", bg=CARD_BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
+        title_row = tk.Frame(inner, bg=CARD_BG)
+        title_row.grid(row=0, column=0, sticky="ew")
+        # 右侧按钮先占位，窗口变窄时不会先被挤掉
+        ttk.Button(title_row, text="使用说明", command=self.open_manual).pack(side="right", padx=(8, 0))
+        ttk.Button(title_row, text="API 设置", command=self.open_settings).pack(side="right", padx=(8, 0))
+        tk.Label(title_row, text=APP_NAME, bg=CARD_BG, fg=TEXT, font=(FONT, 15, "bold")).pack(side="left")
+        tk.Label(title_row, text=f"  v{APP_VERSION}", bg=CARD_BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
 
-        self.stats_var = tk.StringVar(value="")
-        tk.Label(inner, textvariable=self.stats_var, bg=CARD_BG, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=16)
-
-        ttk.Button(inner, text="使用说明", command=self.open_manual).pack(side="right", padx=(8, 0))
-        ttk.Button(inner, text="API 设置", command=self.open_settings).pack(side="right", padx=(8, 0))
-
+        info_row = tk.Frame(inner, bg=CARD_BG)
+        info_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         self.ai_status_var = tk.StringVar(value="AI 状态未知")
-        self.ai_status_label = tk.Label(inner, textvariable=self.ai_status_var, bg=CARD_BG, font=(FONT, 10))
-        self.ai_status_label.pack(side="right", padx=(8, 12))
+        self.ai_status_label = tk.Label(info_row, textvariable=self.ai_status_var, bg=CARD_BG, font=(FONT, 10))
+        self.ai_status_label.pack(side="right", anchor="e")
+        self.stats_var = tk.StringVar(value="")
+        self.stats_label = tk.Label(info_row, textvariable=self.stats_var, bg=CARD_BG, fg=MUTED, font=(FONT, 10))
+        self.stats_label.pack(side="left", anchor="w")
+
+        def on_info_configure(event):
+            half = max(150, event.width // 2 - 20)
+            self.stats_label.configure(wraplength=half)
+            self.ai_status_label.configure(wraplength=half)
+
+        info_row.bind("<Configure>", on_info_configure, add="+")
 
     def _build_body(self):
         self.notebook = ttk.Notebook(self)
@@ -230,6 +297,7 @@ class PracticePanel(tk.Frame):
         self.preview_scheduling = None
 
         self.columnconfigure(0, weight=1)
+        self.bind("<Configure>", self._on_panel_configure, add="+")
         self._build_head()
         self._build_front()
         self._build_answer()
@@ -239,9 +307,17 @@ class PracticePanel(tk.Frame):
         self._build_actions()
 
     # ---------- 界面搭建 ----------
+    def _on_panel_configure(self, event) -> None:
+        """窗口缩放时，让长文本跟着宽度换行。"""
+        width = max(200, event.width - 44)
+        for label in (self.front_label, self.meta_label, self.banner_label):
+            label.configure(wraplength=width)
+        self.confirm_label.configure(wraplength=width - 24)
+
     def _build_head(self):
         head = tk.Frame(self, bg=BG)
         head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        head.columnconfigure(1, weight=1)
         self.mode_chip = tk.Label(
             head,
             text="算法复习" if self.mode == "review" else "自由练习",
@@ -251,13 +327,25 @@ class PracticePanel(tk.Frame):
             padx=9,
             pady=3,
         )
-        self.mode_chip.pack(side="left")
-
         self.position_var = tk.StringVar(value="")
-        tk.Label(head, textvariable=self.position_var, bg=BG, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=10)
 
         rule = "确认后会更新这张卡的 FSRS 复习计划" if self.mode == "review" else "不更新复习计划，也不计入正式复习次数"
-        tk.Label(head, text=rule, bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="right")
+        self.rule_label = tk.Label(head, text=rule, bg=BG, fg=MUTED, font=(FONT, 9), justify="right")
+        self.position_label = tk.Label(head, textvariable=self.position_var, bg=BG, fg=MUTED, font=(FONT, 10))
+        self.mode_chip.grid(row=0, column=0, sticky="w")
+        self.position_label.grid(row=0, column=1, sticky="w", padx=(10, 8))
+        self.rule_label.grid(row=0, column=2, sticky="e")
+
+        def on_head_configure(event):
+            # 窗口够宽时说明文字放在同一行右侧；变窄时自动挪到第二行，避免挤掉位置文字
+            if event.width < 560:
+                self.rule_label.configure(wraplength=max(150, event.width - 20), justify="left")
+                self.rule_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+            else:
+                self.rule_label.configure(wraplength=max(150, event.width - 320), justify="right")
+                self.rule_label.grid(row=0, column=2, sticky="e")
+
+        head.bind("<Configure>", on_head_configure, add="+")
 
     def _build_front(self):
         card = tk.Frame(self, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
@@ -269,19 +357,17 @@ class PracticePanel(tk.Frame):
         self.front_label = tk.Label(inner, text="", bg=CARD_BG, fg=TEXT, font=(FONT, 15, "bold"), justify="left", anchor="w")
         self.front_label.pack(anchor="w", fill="x", pady=(4, 6))
         self.meta_var = tk.StringVar(value="")
-        tk.Label(inner, textvariable=self.meta_var, bg=CARD_BG, fg=MUTED, font=(FONT, 9), justify="left", anchor="w").pack(anchor="w", fill="x")
-
-        def on_configure(event):
-            self.front_label.configure(wraplength=max(240, event.width - 40))
-
-        card.bind("<Configure>", on_configure)
+        self.meta_label = tk.Label(
+            inner, textvariable=self.meta_var, bg=CARD_BG, fg=MUTED, font=(FONT, 9), justify="left", anchor="w"
+        )
+        self.meta_label.pack(anchor="w", fill="x")
 
     def _build_answer(self):
         wrapper = tk.Frame(self, bg=BG)
         wrapper.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         wrapper.columnconfigure(0, weight=1)
         wrapper.rowconfigure(1, weight=1)
-        self.rowconfigure(2, weight=1, minsize=150)
+        self.rowconfigure(2, weight=1, minsize=70)
 
         tk.Label(wrapper, text="先写下你的回答（Ctrl + Enter 提交）", bg=BG, fg=MUTED, font=(FONT, 9)).grid(row=0, column=0, sticky="w")
         box = tk.Frame(wrapper, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
@@ -319,7 +405,7 @@ class PracticePanel(tk.Frame):
             font=(FONT, 10),
             justify="left",
             anchor="w",
-            wraplength=900,
+            wraplength=800,
         )
 
     def _build_result(self):
@@ -361,7 +447,7 @@ class PracticePanel(tk.Frame):
         inner = tk.Frame(frame, bg="#eef0fe")
         inner.pack(fill="x", padx=14, pady=10)
         self.confirm_var = tk.StringVar(value="")
-        tk.Label(
+        self.confirm_label = tk.Label(
             inner,
             textvariable=self.confirm_var,
             bg="#eef0fe",
@@ -369,8 +455,9 @@ class PracticePanel(tk.Frame):
             font=(FONT, 10),
             justify="left",
             anchor="w",
-            wraplength=880,
-        ).pack(anchor="w")
+            wraplength=800,
+        )
+        self.confirm_label.pack(anchor="w", fill="x")
         tk.Label(
             inner,
             text="在你点击确认之前，不会写入任何 FSRS 调度数据。",
@@ -380,7 +467,7 @@ class PracticePanel(tk.Frame):
         ).pack(anchor="w", pady=(4, 0))
 
     def _build_actions(self):
-        bar = tk.Frame(self, bg=BG)
+        bar = FlowBar(self)
         self.actions_bar = bar
         self.actions_bar.grid(row=7, column=0, sticky="ew", pady=(12, 0))
 
@@ -416,13 +503,16 @@ class PracticePanel(tk.Frame):
     def _show_result_area(self, show: bool) -> None:
         if show:
             self.result_box.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
-            self.rowconfigure(5, weight=3, minsize=180)
+            self.rowconfigure(5, weight=3, minsize=110)
+            # 出结果后把输入框收窄一点，让对比结果占更多空间
+            self.answer_text.configure(height=3)
         else:
             self.result_box.grid_remove()
             self.rowconfigure(5, weight=0)
+            self.answer_text.configure(height=5)
 
     def _refresh_actions(self):
-        for button in (
+        buttons = [
             self.btn_submit,
             self.btn_retry,
             self.btn_confirm,
@@ -430,43 +520,43 @@ class PracticePanel(tk.Frame):
             self.btn_skip,
             self.btn_redo,
             self.btn_exit,
-        ):
-            button.pack_forget()
+        ]
+        for button in buttons:
             button.state(["!disabled"])
 
         phase = self.phase
+        visible: list[tk.Widget] = []
         if phase in ("answer", "error"):
             # 失败时只给「重试分析」：回答没改动会复用同一条记录，改了就当作新的作答提交。
-            (self.btn_retry if phase == "error" else self.btn_submit).pack(side="left", padx=(0, 8))
+            visible.append(self.btn_retry if phase == "error" else self.btn_submit)
             if self.on_skip:
-                self.btn_skip.pack(side="left", padx=(0, 8))
+                visible.append(self.btn_skip)
             if self.on_exit:
-                self.btn_exit.pack(side="left")
+                visible.append(self.btn_exit)
         elif phase == "analyzing":
-            self.btn_submit.pack(side="left", padx=(0, 8))
+            visible.append(self.btn_submit)
             self.btn_submit.state(["disabled"])
             if self.on_skip:
-                self.btn_skip.pack(side="left", padx=(0, 8))
+                visible.append(self.btn_skip)
                 self.btn_skip.state(["disabled"])
             if self.on_exit:
-                self.btn_exit.pack(side="left")
+                visible.append(self.btn_exit)
                 self.btn_exit.state(["disabled"])
         elif phase == "result":
             if self.mode == "review":
-                self.btn_confirm.pack(side="left", padx=(0, 8))
+                visible.append(self.btn_confirm)
                 if self.on_skip:
-                    self.btn_skip.pack(side="left", padx=(0, 8))
-                self.btn_redo.pack(side="left", padx=(0, 8))
+                    visible.append(self.btn_skip)
+                visible.append(self.btn_redo)
                 if self.on_exit:
-                    self.btn_exit.pack(side="left")
+                    visible.append(self.btn_exit)
             else:
-                self.btn_next.pack(side="left", padx=(0, 8))
-                self.btn_redo.pack(side="left", padx=(0, 8))
-                self.btn_skip.pack(side="left")
+                visible.extend([self.btn_next, self.btn_redo, self.btn_skip])
         elif phase == "applied":
-            self.btn_next.pack(side="left", padx=(0, 8))
+            visible.append(self.btn_next)
             if self.on_exit:
-                self.btn_exit.pack(side="left")
+                visible.append(self.btn_exit)
+        self.actions_bar.show(visible)
 
     def load(self, card: dict, position_text: str = "") -> None:
         self.persist_draft()
@@ -732,16 +822,27 @@ class ReviewTab(tk.Frame):
 
         top = tk.Frame(self, bg=BG)
         top.grid(row=0, column=0, sticky="ew", pady=(10, 6))
+        # 右侧按钮先占位，窗口变窄时不会被文字挤掉
+        ttk.Button(top, text="重新开始本轮", command=self.restart).pack(side="right")
         self.progress_var = tk.StringVar(value="")
-        tk.Label(top, textvariable=self.progress_var, bg=BG, fg=TEXT, font=(FONT, 10, "bold")).pack(side="left")
-        tk.Label(
+        self.progress_label = tk.Label(top, textvariable=self.progress_var, bg=BG, fg=TEXT, font=(FONT, 10, "bold"))
+        self.progress_label.pack(side="left")
+        self.progress_hint = tk.Label(
             top,
             text="只出现 FSRS 判定到期的卡片（含新卡）。匹配分析成功并确认后，才写入复习计划。",
             bg=BG,
             fg=MUTED,
             font=(FONT, 9),
-        ).pack(side="left", padx=12)
-        ttk.Button(top, text="重新开始本轮", command=self.restart).pack(side="right")
+            justify="left",
+        )
+        self.progress_hint.pack(side="left", padx=12)
+
+        def on_top_configure(event):
+            self.progress_hint.configure(wraplength=max(140, event.width - 260))
+
+        top.bind("<Configure>", on_top_configure, add="+")
+
+        self.rowconfigure(0, weight=0)
 
         self.panel = PracticePanel(
             self,
@@ -758,7 +859,7 @@ class ReviewTab(tk.Frame):
         self.notice_inner = tk.Frame(self.notice_frame, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
         self.notice_inner.pack(fill="x", pady=(0, 10))
         self.notice_var = tk.StringVar(value="")
-        tk.Label(
+        self.notice_label = tk.Label(
             self.notice_inner,
             textvariable=self.notice_var,
             bg=CARD_BG,
@@ -766,14 +867,19 @@ class ReviewTab(tk.Frame):
             font=(FONT, 11),
             justify="left",
             anchor="w",
-            wraplength=880,
+            wraplength=800,
             padx=16,
             pady=14,
-        ).pack(anchor="w", fill="x")
-        self.notice_actions = tk.Frame(self.notice_inner, bg=CARD_BG)
+        )
+        self.notice_label.pack(anchor="w", fill="x")
+        adaptive_wrap(self.notice_label, self.notice_inner, 60)
+        self.notice_actions = FlowBar(self.notice_inner, bg=CARD_BG)
         self.notice_actions.pack(anchor="w", padx=16, pady=(0, 14))
-        ttk.Button(self.notice_actions, text="去自由练习", command=lambda: self.app.notebook.select(1)).pack(side="left", padx=(0, 8))
-        ttk.Button(self.notice_actions, text="查看全部闪卡", command=lambda: self.app.notebook.select(2)).pack(side="left", padx=(0, 8))
+        self.notice_buttons = [
+            ttk.Button(self.notice_actions, text="去自由练习", command=lambda: self.app.notebook.select(1)),
+            ttk.Button(self.notice_actions, text="查看全部闪卡", command=lambda: self.app.notebook.select(2)),
+        ]
+        self.notice_actions.show(self.notice_buttons)
         self.notice_frame.grid(row=1, column=0, sticky="nsew")
         self.notice_frame.grid_remove()
 
@@ -851,6 +957,22 @@ class FreeTab(tk.Frame):
         paned.add(left, weight=1)
         paned.add(right, weight=3)
 
+        size_state = {"last_width": None}
+
+        def keep_right_usable(event):
+            """只在窗口变窄时收窄左侧列表，保证右侧练习区仍然放得下；不会打断手动拖动分隔条。"""
+            last_width = size_state["last_width"]
+            size_state["last_width"] = event.width
+            if last_width is None or event.width >= last_width:
+                return
+            try:
+                if event.width - paned.sashpos(0) < int(event.width * 0.45):
+                    paned.sashpos(0, max(160, int(event.width * 0.25)))
+            except tk.TclError:
+                pass
+
+        paned.bind("<Configure>", keep_right_usable, add="+")
+
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
 
@@ -873,18 +995,27 @@ class FreeTab(tk.Frame):
         tree_wrap.columnconfigure(0, weight=1)
         tree_wrap.rowconfigure(0, weight=1)
         self.tree = ttk.Treeview(tree_wrap, columns=("front",), show="tree", selectmode="browse")
-        self.tree.column("#0", width=280)
+        self.tree.column("#0", width=260)
         self.tree.grid(row=0, column=0, sticky="nsew")
+
+        def resize_tree(event):
+            self.tree.column("#0", width=max(150, event.width - 26))
+
+        tree_wrap.bind("<Configure>", resize_tree, add="+")
         scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", lambda _event: self.practice_selected())
 
-        buttons = tk.Frame(left, bg=BG)
+        buttons = FlowBar(left)
         buttons.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(buttons, text="随机抽一张", style="Primary.TButton", command=self.random_card).pack(side="left")
-        ttk.Button(buttons, text="练这一张", command=self.practice_selected).pack(side="left", padx=(8, 0))
+        buttons.show(
+            [
+                ttk.Button(buttons, text="随机抽一张", style="Primary.TButton", command=self.random_card),
+                ttk.Button(buttons, text="练这一张", command=self.practice_selected),
+            ]
+        )
 
         self.panel = PracticePanel(
             right,
@@ -903,6 +1034,8 @@ class FreeTab(tk.Frame):
         self.panel.position_var.set("左侧选一张卡片，或点「随机抽一张」")
         if not self.app.cards:
             self.panel._set_banner("还没有卡片。请到「全部闪卡」页新建一张，或导入一份 JSON 备份。", "error")
+        else:
+            self.panel._set_banner("")
 
     def reload(self):
         cards = query_cards(self.app.cards, self.search_var.get(), "all", "created_desc")
@@ -919,6 +1052,9 @@ class FreeTab(tk.Frame):
             self.tree.insert("", "end", iid=card["id"], text=f"{label}{suffix}")
         if selected and self.tree.exists(selected):
             self.tree.selection_set(selected)
+        # 没有在练的卡片时，重新判断空状态提示（避免残留「还没有卡片」）
+        if self.current_id is None or self.app.card_by_id(self.current_id) is None:
+            self._show_empty_hint()
 
     def _on_select(self, _event=None):
         selection = self.tree.selection()
@@ -986,28 +1122,33 @@ class CardsTab(tk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
 
-        toolbar = tk.Frame(self, bg=BG)
+        toolbar = FlowBar(self)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(10, 6))
 
         self.search_var = tk.StringVar(value="")
         self.search_var.trace_add("write", lambda *_args: self.reload())
-        ttk.Entry(toolbar, textvariable=self.search_var, width=28).pack(side="left")
+        search_entry = ttk.Entry(toolbar, textvariable=self.search_var, width=24)
 
         self.filter_var = tk.StringVar(value=self.FILTERS[0][0])
-        filter_box = ttk.Combobox(toolbar, textvariable=self.filter_var, values=[label for label, _ in self.FILTERS], width=14, state="readonly")
-        filter_box.pack(side="left", padx=(8, 0))
+        filter_box = ttk.Combobox(toolbar, textvariable=self.filter_var, values=[label for label, _ in self.FILTERS], width=13, state="readonly")
         filter_box.bind("<<ComboboxSelected>>", lambda _event: self.reload())
 
         self.sort_var = tk.StringVar(value=self.SORTS[0][0])
-        sort_box = ttk.Combobox(toolbar, textvariable=self.sort_var, values=[label for label, _ in self.SORTS], width=18, state="readonly")
-        sort_box.pack(side="left", padx=(8, 0))
+        sort_box = ttk.Combobox(toolbar, textvariable=self.sort_var, values=[label for label, _ in self.SORTS], width=16, state="readonly")
         sort_box.bind("<<ComboboxSelected>>", lambda _event: self.reload())
 
-        ttk.Button(toolbar, text="导出 JSON", command=self.export_backup).pack(side="right")
-        ttk.Button(toolbar, text="导入 JSON", command=self.import_backup).pack(side="right", padx=(0, 8))
-        ttk.Button(toolbar, text="删除", style="Danger.TButton", command=self.delete_selected).pack(side="right", padx=(0, 8))
-        ttk.Button(toolbar, text="编辑", command=self.edit_selected).pack(side="right", padx=(0, 8))
-        ttk.Button(toolbar, text="新建卡片", style="Primary.TButton", command=self.create_card).pack(side="right", padx=(0, 8))
+        toolbar.show(
+            [
+                search_entry,
+                filter_box,
+                sort_box,
+                ttk.Button(toolbar, text="新建卡片", style="Primary.TButton", command=self.create_card),
+                ttk.Button(toolbar, text="编辑", command=self.edit_selected),
+                ttk.Button(toolbar, text="删除", style="Danger.TButton", command=self.delete_selected),
+                ttk.Button(toolbar, text="导入 JSON", command=self.import_backup),
+                ttk.Button(toolbar, text="导出 JSON", command=self.export_backup),
+            ]
+        )
 
         self.count_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.count_var, bg=BG, fg=MUTED, font=(FONT, 9)).grid(row=1, column=0, sticky="w", pady=(0, 6))
@@ -1032,12 +1173,23 @@ class CardsTab(tk.Frame):
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
+        hscroll = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
+        hscroll.grid(row=1, column=0, sticky="ew")
         self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.configure(xscrollcommand=hscroll.set)
         self.tree.bind("<Double-1>", lambda _event: self.edit_selected())
+
+        def resize_columns(event):
+            """列宽按比例跟着窗口走，窗口拉宽拉窄都不需要手动调整。"""
+            total = max(520, event.width - 40)
+            for key, ratio in (("front", 0.33), ("back", 0.31), ("status", 0.09), ("due", 0.19), ("reps", 0.08)):
+                self.tree.column(key, width=max(70, int(total * ratio)))
+
+        table.bind("<Configure>", resize_columns, add="+")
 
         hint = tk.Frame(self, bg=BG)
         hint.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        tk.Label(
+        self.hint_label = tk.Label(
             hint,
             text=f"匹配分数 → 复习计划映射：{describe_bands()}。"
             "修改标准回复不会重置这张卡的复习历史；删除卡片会同时清理它的调度状态、复习日志与作答记录。",
@@ -1045,8 +1197,10 @@ class CardsTab(tk.Frame):
             fg=MUTED,
             font=(FONT, 9),
             justify="left",
-            wraplength=1000,
-        ).pack(anchor="w")
+            wraplength=900,
+        )
+        self.hint_label.pack(anchor="w")
+        adaptive_wrap(self.hint_label, hint, 20)
 
     # ---------- 列表 ----------
     def _current_query(self):
@@ -1213,7 +1367,7 @@ class CardEditorDialog(tk.Toplevel):
         self.back_text = tk.Text(body, height=6, wrap="word", font=(FONT, 11), bg=CARD_BG, relief="solid", borderwidth=1, padx=8, pady=6)
         self.back_text.pack(fill="both", expand=True, pady=(4, 8))
 
-        tk.Label(
+        self.hint_label = tk.Label(
             body,
             text="修改标准回复只影响卡面内容，不会重置这张卡的 FSRS 复习历史与下次复习时间。",
             bg=BG,
@@ -1221,7 +1375,9 @@ class CardEditorDialog(tk.Toplevel):
             font=(FONT, 9),
             justify="left",
             wraplength=520,
-        ).pack(anchor="w")
+        )
+        self.hint_label.pack(anchor="w")
+        adaptive_wrap(self.hint_label, body, 30)
 
         self.error_var = tk.StringVar(value="")
         tk.Label(body, textvariable=self.error_var, bg=BG, fg=DANGER, font=(FONT, 9)).pack(anchor="w", pady=(6, 0))
@@ -1381,7 +1537,9 @@ class ImportDialog(tk.Toplevel):
         body.pack(fill="both", expand=True, padx=16, pady=14)
 
         tk.Label(body, text="文件校验通过：", bg=BG, fg=OK, font=(FONT, 10, "bold")).pack(anchor="w")
-        tk.Label(body, text=summary, bg=BG, fg=TEXT, font=(FONT, 10), justify="left", wraplength=520).pack(anchor="w", pady=(4, 12))
+        self.summary_label = tk.Label(body, text=summary, bg=BG, fg=TEXT, font=(FONT, 10), justify="left", wraplength=520)
+        self.summary_label.pack(anchor="w", fill="x", pady=(4, 12))
+        adaptive_wrap(self.summary_label, body, 30)
 
         self.mode_var = tk.StringVar(value="merge")
         ttk.Radiobutton(
