@@ -3,6 +3,7 @@
 import os
 import threading
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from app import APP_NAME, APP_VERSION, ai, paths
@@ -15,16 +16,27 @@ from app.scheduling import STATE_LABELS
 from app.seeds import SEED_CARDS
 from app.storage import Database, now_ms, query_cards, stats_of
 
-BG = "#f6f7f9"
+# 配色：深色侧边栏 + 浅色内容区（参考 Linear / Notion 这类现代效率工具）
+BG = "#f7f7f9"
 CARD_BG = "#ffffff"
-BORDER = "#dcdfe4"
-TEXT = "#1b1e23"
-MUTED = "#6b7280"
-ACCENT = "#4f5bff"
-ACCENT_DARK = "#3f49d6"
-OK = "#0f8a56"
-WARN = "#a5761a"
-DANGER = "#c8341c"
+BORDER = "#e7e8ec"
+BORDER_STRONG = "#d5d7de"
+TEXT = "#15171c"
+MUTED = "#71747d"
+ACCENT = "#5b5bd6"
+ACCENT_DARK = "#4a4ac0"
+ACCENT_SOFT = "#eeeefc"
+OK = "#0f9d63"
+OK_SOFT = "#e9f7f1"
+WARN = "#b0761a"
+WARN_SOFT = "#fdf3e4"
+DANGER = "#d33a2c"
+DANGER_SOFT = "#fdecea"
+SIDEBAR_BG = "#1b1c21"
+SIDEBAR_HOVER = "#26272e"
+SIDEBAR_ACTIVE = "#2e3038"
+SIDEBAR_TEXT = "#e8e9ef"
+SIDEBAR_MUTED = "#8b8d99"
 FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
 
@@ -32,6 +44,100 @@ MONO = "Consolas"
 def truncate(text: str, length: int = 60) -> str:
     text = (text or "").replace("\n", " ")
     return text if len(text) <= length else text[: length - 1] + "…"
+
+
+def compact_datetime(timestamp_ms: int) -> str:
+    """把时间戳压短一点，表格里看起来更清爽。"""
+    moment = datetime.fromtimestamp(int(timestamp_ms) / 1000)
+    if moment.year == datetime.now().year:
+        return moment.strftime("%m-%d %H:%M")
+    return moment.strftime("%Y-%m-%d")
+
+
+class ScoreBar(tk.Canvas):
+    """圆角的匹配度进度条：比系统自带的进度条更干净，颜色跟着评分区间走。"""
+
+    def __init__(self, parent, height: int = 9, **kwargs):
+        super().__init__(parent, height=height, bg=CARD_BG, highlightthickness=0, bd=0, **kwargs)
+        self._value = 0.0
+        self.bind("<Configure>", lambda _event: self._draw())
+
+    def set(self, value: float) -> None:
+        self._value = max(0.0, min(100.0, float(value)))
+        self._draw()
+
+    def _color(self) -> str:
+        if self._value < 40:
+            return DANGER
+        if self._value < 65:
+            return WARN
+        if self._value < 85:
+            return ACCENT
+        return OK
+
+    def _rounded(self, x1, y1, x2, y2, radius, **kwargs):
+        points = [
+            x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+            x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
+            x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
+        ]
+        return self.create_polygon(points, smooth=True, **kwargs)
+
+    def _draw(self) -> None:
+        self.delete("all")
+        width = self.winfo_width()
+        height = int(self["height"])
+        if width <= 4:
+            return
+        radius = height / 2
+        self._rounded(1, 1, width - 1, height - 1, radius, fill="#ecedf1", outline="")
+        filled = (width - 2) * self._value / 100
+        if filled >= 1:
+            self._rounded(1, 1, max(1 + height, filled + 1), height - 1, radius, fill=self._color(), outline="")
+
+
+class NavItem(tk.Frame):
+    """侧边栏导航项：深色底、悬停高亮，选中时左侧有一条强调色指示条。"""
+
+    def __init__(self, parent, text: str, command, badge_var=None):
+        super().__init__(parent, bg=SIDEBAR_BG, cursor="hand2")
+        self.indicator = tk.Frame(self, bg=SIDEBAR_BG, width=3)
+        self.indicator.pack(side="left", fill="y")
+        self.inner = tk.Frame(self, bg=SIDEBAR_BG)
+        self.inner.pack(side="left", fill="both", expand=True, padx=(11, 12), pady=9)
+        self.label = tk.Label(self.inner, text=text, bg=SIDEBAR_BG, fg=SIDEBAR_MUTED, font=(FONT, 11), anchor="w")
+        self.label.pack(side="left")
+        self.badge = None
+        if badge_var is not None:
+            self.badge = tk.Label(
+                self.inner, textvariable=badge_var, bg=ACCENT, fg="#ffffff", font=(FONT, 8, "bold"), padx=6
+            )
+            self.badge.pack(side="right")
+        self._active = False
+
+        targets = [self, self.inner, self.label] + ([self.badge] if self.badge is not None else [])
+        for widget in targets:
+            widget.bind("<Button-1>", lambda _event: command())
+            widget.bind("<Enter>", lambda _event: self._hover(True))
+            widget.bind("<Leave>", lambda _event: self._hover(False))
+
+    def _paint(self, background: str, foreground: str) -> None:
+        self.configure(bg=background)
+        self.inner.configure(bg=background)
+        self.label.configure(bg=background, fg=foreground)
+        self.indicator.configure(bg=ACCENT if self._active else background)
+
+    def _hover(self, hovering: bool) -> None:
+        if self._active:
+            return
+        if hovering:
+            self._paint(SIDEBAR_HOVER, SIDEBAR_TEXT)
+        else:
+            self._paint(SIDEBAR_BG, SIDEBAR_MUTED)
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self._paint(SIDEBAR_ACTIVE if active else SIDEBAR_BG, "#ffffff" if active else SIDEBAR_MUTED)
 
 
 class FlowBar(tk.Frame):
@@ -106,13 +212,12 @@ class FlashcardApp(tk.Tk):
         self.configure(bg=BG)
 
         self._setup_style()
-        self._build_header()
-        self._build_body()
-        self._build_status_bar()
+        self._build_shell()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_all()
         self.review_tab.ensure_queue()
+        self.show_page(0)
 
     # ---------- 样式 ----------
     def _setup_style(self):
@@ -125,78 +230,136 @@ class FlashcardApp(tk.Tk):
         style.configure("TFrame", background=BG)
         style.configure("Card.TFrame", background=CARD_BG)
         style.configure("TLabel", background=BG, foreground=TEXT)
-        style.configure("Card.TLabel", background=CARD_BG, foreground=TEXT)
         style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=(FONT, 9))
-        style.configure("CardMuted.TLabel", background=CARD_BG, foreground=MUTED, font=(FONT, 9))
-        style.configure("Title.TLabel", font=(FONT, 15, "bold"))
-        style.configure("Front.TLabel", background=CARD_BG, font=(FONT, 14, "bold"), foreground=TEXT)
-        style.configure("H1.TLabel", font=(FONT, 11, "bold"))
-        style.configure("TButton", padding=(11, 6))
-        style.configure("Primary.TButton", background=ACCENT, foreground="#ffffff", padding=(13, 7))
+        style.configure("Title.TLabel", font=(FONT, 17, "bold"))
+
+        # 扁平按钮：主按钮用强调色，普通按钮白底细边，危险操作用红色文字
+        style.configure("TButton", padding=(12, 7), borderwidth=1, relief="flat", background=CARD_BG,
+                        bordercolor=BORDER_STRONG, lightcolor=CARD_BG, darkcolor=CARD_BG)
+        style.map(
+            "TButton",
+            background=[("active", "#f2f3f6"), ("pressed", "#e9eaee"), ("disabled", BG)],
+            bordercolor=[("disabled", BORDER)],
+            foreground=[("disabled", "#b3b5bd")],
+        )
+        style.configure("Primary.TButton", background=ACCENT, foreground="#ffffff", padding=(14, 8),
+                        bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT)
         style.map(
             "Primary.TButton",
-            background=[("active", ACCENT_DARK), ("disabled", "#c3c8ea")],
-            foreground=[("disabled", "#f2f3fb")],
+            background=[("active", ACCENT_DARK), ("pressed", ACCENT_DARK), ("disabled", "#c5c5e8")],
+            foreground=[("disabled", "#f4f4fd")],
+            bordercolor=[("disabled", "#c5c5e8")],
         )
-        style.configure("Danger.TButton", foreground=DANGER)
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(16, 8), font=(FONT, 10))
-        style.map("TNotebook.Tab", background=[("selected", CARD_BG)])
-        style.configure("Treeview", background=CARD_BG, fieldbackground=CARD_BG, rowheight=26)
-        style.configure("Treeview.Heading", font=(FONT, 9, "bold"))
-        style.configure("TEntry", padding=4)
-        style.configure("TCombobox", padding=3)
+        style.configure("Danger.TButton", foreground=DANGER, bordercolor="#eccdc9",
+                        lightcolor=CARD_BG, darkcolor=CARD_BG)
+        style.map("Danger.TButton", background=[("active", DANGER_SOFT)], foreground=[("disabled", "#c9a9a5")])
+        style.configure("Sidebar.TButton", background=ACCENT, foreground="#ffffff", padding=(10, 7),
+                        borderwidth=0, font=(FONT, 10), lightcolor=ACCENT, darkcolor=ACCENT)
+        style.map("Sidebar.TButton", background=[("active", ACCENT_DARK)])
+        style.configure("SidebarGhost.TButton", background=SIDEBAR_BG, foreground=SIDEBAR_TEXT, padding=(10, 7),
+                        borderwidth=0, font=(FONT, 10), lightcolor=SIDEBAR_BG, darkcolor=SIDEBAR_BG)
+        style.map("SidebarGhost.TButton", background=[("active", SIDEBAR_ACTIVE)])
 
-    def _build_header(self):
-        header = tk.Frame(self, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
-        header.pack(fill="x", side="top")
+        style.configure("Treeview", background=CARD_BG, fieldbackground=CARD_BG, rowheight=30,
+                        borderwidth=0, font=(FONT, 10))
+        style.configure("Treeview.Heading", font=(FONT, 9, "bold"), background=BG, foreground=MUTED,
+                        relief="flat", borderwidth=0, padding=(6, 8))
+        style.map("Treeview.Heading", background=[("active", BG)])
+        style.map("Treeview", background=[("selected", ACCENT_SOFT)], foreground=[("selected", TEXT)])
 
-        inner = tk.Frame(header, bg=CARD_BG)
-        inner.pack(fill="x", padx=16, pady=10)
-        inner.columnconfigure(0, weight=1)
+        style.configure("TEntry", padding=6, fieldbackground=CARD_BG, bordercolor=BORDER_STRONG,
+                        lightcolor=BORDER_STRONG, darkcolor=BORDER_STRONG)
+        style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
+        style.configure("TCombobox", padding=5, fieldbackground=CARD_BG, bordercolor=BORDER_STRONG,
+                        arrowcolor=MUTED, lightcolor=BORDER_STRONG, darkcolor=BORDER_STRONG)
+        style.map("TCombobox", bordercolor=[("focus", ACCENT)], fieldbackground=[("readonly", CARD_BG)])
+        style.configure("TScrollbar", background="#d9dae0", troughcolor=BG, borderwidth=0, arrowsize=12,
+                        relief="flat")
+        style.map("TScrollbar", background=[("active", "#c3c5cd")])
+        style.configure("TCheckbutton", background=BG, foreground=TEXT)
+        style.map("TCheckbutton", background=[("active", BG)])
+        style.configure("TRadiobutton", background=BG, foreground=TEXT)
+        style.map("TRadiobutton", background=[("active", BG)])
 
-        title_row = tk.Frame(inner, bg=CARD_BG)
-        title_row.grid(row=0, column=0, sticky="ew")
-        # 右侧按钮先占位，窗口变窄时不会先被挤掉
-        ttk.Button(title_row, text="使用说明", command=self.open_manual).pack(side="right", padx=(8, 0))
-        ttk.Button(title_row, text="API 设置", command=self.open_settings).pack(side="right", padx=(8, 0))
-        tk.Label(title_row, text=APP_NAME, bg=CARD_BG, fg=TEXT, font=(FONT, 15, "bold")).pack(side="left")
-        tk.Label(title_row, text=f"  v{APP_VERSION}", bg=CARD_BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
+    def _build_shell(self):
+        """整体布局：左侧深色导航栏 + 右侧内容区 + 底部状态栏。"""
+        self.columnconfigure(0, weight=0, minsize=210)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        info_row = tk.Frame(inner, bg=CARD_BG)
-        info_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        # ---------- 左侧导航 ----------
+        sidebar = tk.Frame(self, bg=SIDEBAR_BG, width=210)
+        sidebar.grid(row=0, column=0, sticky="nsw")
+        sidebar.grid_propagate(False)
+
+        brand = tk.Frame(sidebar, bg=SIDEBAR_BG)
+        brand.pack(fill="x", padx=18, pady=(20, 12))
+        tk.Label(brand, text=APP_NAME, bg=SIDEBAR_BG, fg="#ffffff", font=(FONT, 13, "bold")).pack(anchor="w")
+        tk.Label(brand, text=f"v{APP_VERSION}", bg=SIDEBAR_BG, fg=SIDEBAR_MUTED, font=(FONT, 8)).pack(anchor="w", pady=(2, 0))
+
+        self.due_badge_var = tk.StringVar(value="")
+        self.nav_items = [
+            NavItem(sidebar, "今日复习", lambda: self.show_page(0), self.due_badge_var),
+            NavItem(sidebar, "自由练习", lambda: self.show_page(1)),
+            NavItem(sidebar, "全部闪卡", lambda: self.show_page(2)),
+        ]
+        for item in self.nav_items:
+            item.pack(fill="x", pady=1)
+
+        bottom = tk.Frame(sidebar, bg=SIDEBAR_BG)
+        bottom.pack(side="bottom", fill="x", padx=16, pady=16)
         self.ai_status_var = tk.StringVar(value="AI 状态未知")
-        self.ai_status_label = tk.Label(info_row, textvariable=self.ai_status_var, bg=CARD_BG, font=(FONT, 10))
-        self.ai_status_label.pack(side="right", anchor="e")
+        self.ai_status_label = tk.Label(
+            bottom, textvariable=self.ai_status_var, bg=SIDEBAR_BG, fg=SIDEBAR_MUTED,
+            font=(FONT, 9), justify="left", anchor="w", wraplength=178,
+        )
+        self.ai_status_label.pack(anchor="w", pady=(0, 10))
+        ttk.Button(bottom, text="API 设置", style="Sidebar.TButton", command=self.open_settings).pack(fill="x")
+        ttk.Button(bottom, text="使用说明", style="SidebarGhost.TButton", command=self.open_manual).pack(fill="x", pady=(6, 0))
+
+        # ---------- 右侧内容区 ----------
+        content = tk.Frame(self, bg=BG)
+        content.grid(row=0, column=1, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(1, weight=1)
+
+        top = tk.Frame(content, bg=BG)
+        top.grid(row=0, column=0, sticky="ew", padx=22, pady=(20, 10))
+        self.page_title_var = tk.StringVar(value="")
+        tk.Label(top, textvariable=self.page_title_var, bg=BG, fg=TEXT, font=(FONT, 17, "bold")).pack(anchor="w")
         self.stats_var = tk.StringVar(value="")
-        self.stats_label = tk.Label(info_row, textvariable=self.stats_var, bg=CARD_BG, fg=MUTED, font=(FONT, 10))
-        self.stats_label.pack(side="left", anchor="w")
+        self.stats_label = tk.Label(top, textvariable=self.stats_var, bg=BG, fg=MUTED, font=(FONT, 9))
+        self.stats_label.pack(anchor="w", pady=(3, 0))
 
-        def on_info_configure(event):
-            half = max(150, event.width // 2 - 20)
-            self.stats_label.configure(wraplength=half)
-            self.ai_status_label.configure(wraplength=half)
+        self.pages_frame = tk.Frame(content, bg=BG)
+        self.pages_frame.grid(row=1, column=0, sticky="nsew", padx=22, pady=(0, 6))
+        self.pages_frame.columnconfigure(0, weight=1)
+        self.pages_frame.rowconfigure(0, weight=1)
 
-        info_row.bind("<Configure>", on_info_configure, add="+")
-
-    def _build_body(self):
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=14, pady=(12, 6))
-
-        self.review_tab = ReviewTab(self.notebook, self)
-        self.free_tab = FreeTab(self.notebook, self)
-        self.cards_tab = CardsTab(self.notebook, self)
-
-        self.notebook.add(self.review_tab, text="今日复习")
-        self.notebook.add(self.free_tab, text="自由练习")
-        self.notebook.add(self.cards_tab, text="全部闪卡")
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-    def _build_status_bar(self):
         self.status_var = tk.StringVar(value="准备就绪。数据保存在程序文件夹的 data 目录里。")
-        bar = tk.Frame(self, bg=BG)
-        bar.pack(fill="x", side="bottom", padx=16, pady=(0, 8))
-        tk.Label(bar, textvariable=self.status_var, bg=BG, fg=MUTED, font=(FONT, 9), anchor="w").pack(fill="x")
+        tk.Label(content, textvariable=self.status_var, bg=BG, fg=MUTED, font=(FONT, 9), anchor="w").grid(
+            row=2, column=0, sticky="ew", padx=22, pady=(0, 10)
+        )
+
+        self.review_tab = ReviewTab(self.pages_frame, self)
+        self.free_tab = FreeTab(self.pages_frame, self)
+        self.cards_tab = CardsTab(self.pages_frame, self)
+        self.pages = [self.review_tab, self.free_tab, self.cards_tab]
+        self.page_titles = ["今日复习", "自由练习", "全部闪卡"]
+        for page in self.pages:
+            page.grid(row=0, column=0, sticky="nsew")
+        self.current_page = 0
+
+    def show_page(self, index: int) -> None:
+        self.current_page = index
+        self.pages[index].tkraise()
+        for position, item in enumerate(self.nav_items):
+            item.set_active(position == index)
+        self.page_title_var.set(self.page_titles[index])
+        if index == 0:
+            self.review_tab.ensure_queue()
+        elif index == 1:
+            self.free_tab.reload()
 
     # ---------- 基础能力 ----------
     def set_status(self, text: str) -> None:
@@ -229,6 +392,7 @@ class FlashcardApp(tk.Tk):
     def refresh_all(self) -> None:
         self.reload_cards()
         self.stats_var.set(f"今日到期 {self.stats['due']} 张（新卡 {self.stats['new']}）· 共 {self.stats['total']} 张")
+        self.due_badge_var.set(str(self.stats["due"]) if self.stats["due"] else "")
         self.refresh_ai_status()
         self.cards_tab.reload()
         self.free_tab.reload()
@@ -239,18 +403,11 @@ class FlashcardApp(tk.Tk):
         source = paths.api_key_source(self.settings)
         if key:
             origin = "设置" if source == "settings" else "环境变量"
-            self.ai_status_var.set(f"● 已连接 DeepSeek · {self.settings['model']}（密钥来自{origin}）")
-            self.ai_status_label.configure(fg=OK)
+            self.ai_status_var.set(f"● DeepSeek 已连接\n{self.settings['model']} · 密钥来自{origin}")
+            self.ai_status_label.configure(fg="#5fd39a")
         else:
-            self.ai_status_var.set("● 未配置 API 密钥")
-            self.ai_status_label.configure(fg=DANGER)
-
-    def _on_tab_changed(self, _event=None) -> None:
-        current = self.notebook.index(self.notebook.select())
-        if current == 0:
-            self.review_tab.ensure_queue()
-        elif current == 1:
-            self.free_tab.reload()
+            self.ai_status_var.set("● 未配置 API 密钥\n点下面的按钮填写")
+            self.ai_status_label.configure(fg="#ff8a7a")
 
     def open_settings(self) -> None:
         SettingsDialog(self, self)
@@ -350,12 +507,13 @@ class PracticePanel(tk.Frame):
     def _build_front(self):
         card = tk.Frame(self, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
         card.grid(row=1, column=0, sticky="ew")
+        tk.Frame(card, bg=ACCENT, width=3).pack(side="left", fill="y")
         inner = tk.Frame(card, bg=CARD_BG)
-        inner.pack(fill="both", expand=True, padx=16, pady=12)
+        inner.pack(side="left", fill="both", expand=True, padx=18, pady=14)
 
-        tk.Label(inner, text="情境 / 问题", bg=CARD_BG, fg=MUTED, font=(FONT, 9)).pack(anchor="w")
-        self.front_label = tk.Label(inner, text="", bg=CARD_BG, fg=TEXT, font=(FONT, 15, "bold"), justify="left", anchor="w")
-        self.front_label.pack(anchor="w", fill="x", pady=(4, 6))
+        tk.Label(inner, text="情 境 / 问 题", bg=CARD_BG, fg=MUTED, font=(FONT, 8)).pack(anchor="w")
+        self.front_label = tk.Label(inner, text="", bg=CARD_BG, fg=TEXT, font=(FONT, 16, "bold"), justify="left", anchor="w")
+        self.front_label.pack(anchor="w", fill="x", pady=(5, 7))
         self.meta_var = tk.StringVar(value="")
         self.meta_label = tk.Label(
             inner, textvariable=self.meta_var, bg=CARD_BG, fg=MUTED, font=(FONT, 9), justify="left", anchor="w"
@@ -409,6 +567,31 @@ class PracticePanel(tk.Frame):
         )
 
     def _build_result(self):
+        # 匹配度卡片：大号数字 + 圆角进度条
+        score_card = tk.Frame(self, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
+        self.score_frame = score_card
+        score_inner = tk.Frame(score_card, bg=CARD_BG)
+        score_inner.pack(fill="x", padx=18, pady=(14, 12))
+        head = tk.Frame(score_inner, bg=CARD_BG)
+        head.pack(fill="x")
+        tk.Label(head, text="匹配程度", bg=CARD_BG, fg=MUTED, font=(FONT, 10)).pack(side="left")
+        self.score_var = tk.StringVar(value="—")
+        tk.Label(head, textvariable=self.score_var, bg=CARD_BG, fg=TEXT, font=(FONT, 24, "bold")).pack(side="right")
+        self.score_bar = ScoreBar(score_inner, height=9)
+        self.score_bar.pack(fill="x", pady=(6, 8))
+        self.score_hint = tk.Label(
+            score_inner,
+            text="这个百分比只表示「我的回答」与「这张卡的标准回复」的接近程度，不代表对你个人的评价，也不是社交能力评分。",
+            bg=CARD_BG,
+            fg=MUTED,
+            font=(FONT, 9),
+            justify="left",
+            anchor="w",
+            wraplength=800,
+        )
+        self.score_hint.pack(anchor="w", fill="x")
+        adaptive_wrap(self.score_hint, score_inner, 60)
+
         box = tk.Frame(self, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
         self.result_box = box
         box.columnconfigure(0, weight=1)
@@ -416,14 +599,14 @@ class PracticePanel(tk.Frame):
 
         self.result_text = tk.Text(
             box,
-            height=13,
+            height=12,
             wrap="word",
             font=(FONT, 10),
             bg=CARD_BG,
             fg=TEXT,
             relief="flat",
-            padx=14,
-            pady=10,
+            padx=16,
+            pady=12,
             state="disabled",
             cursor="arrow",
         )
@@ -432,25 +615,24 @@ class PracticePanel(tk.Frame):
         scroll.grid(row=0, column=1, sticky="ns")
         self.result_text.configure(yscrollcommand=scroll.set)
 
-        self.result_text.tag_configure("score", font=(FONT, 20, "bold"), foreground=TEXT, spacing3=4)
-        self.result_text.tag_configure("h1", font=(FONT, 10, "bold"), foreground=MUTED, spacing1=10, spacing3=3)
+        self.result_text.tag_configure("h1", font=(FONT, 9, "bold"), foreground=MUTED, spacing1=12, spacing3=4)
         self.result_text.tag_configure("body", font=(FONT, 11), foreground=TEXT, spacing3=2)
         self.result_text.tag_configure("ok", font=(FONT, 11), foreground=OK, spacing3=2, lmargin1=14, lmargin2=22)
         self.result_text.tag_configure("warn", font=(FONT, 11), foreground=WARN, spacing3=2, lmargin1=14, lmargin2=22)
         self.result_text.tag_configure("diff", font=(FONT, 11), foreground=DANGER, spacing3=2, lmargin1=14, lmargin2=22)
         self.result_text.tag_configure("muted", font=(FONT, 9), foreground=MUTED, spacing1=6)
-        self.result_text.tag_configure("back", font=(FONT, 12, "bold"), foreground=TEXT, spacing3=2)
+        self.result_text.tag_configure("back", font=(FONT, 12), foreground=TEXT, spacing3=2)
 
     def _build_confirm(self):
-        frame = tk.Frame(self, bg="#eef0fe", highlightbackground="#c9cffb", highlightthickness=1)
+        frame = tk.Frame(self, bg=ACCENT_SOFT, highlightbackground="#cfcffa", highlightthickness=1)
         self.confirm_frame = frame
-        inner = tk.Frame(frame, bg="#eef0fe")
-        inner.pack(fill="x", padx=14, pady=10)
+        inner = tk.Frame(frame, bg=ACCENT_SOFT)
+        inner.pack(fill="x", padx=16, pady=12)
         self.confirm_var = tk.StringVar(value="")
         self.confirm_label = tk.Label(
             inner,
             textvariable=self.confirm_var,
-            bg="#eef0fe",
+            bg=ACCENT_SOFT,
             fg=TEXT,
             font=(FONT, 10),
             justify="left",
@@ -461,7 +643,7 @@ class PracticePanel(tk.Frame):
         tk.Label(
             inner,
             text="在你点击确认之前，不会写入任何 FSRS 调度数据。",
-            bg="#eef0fe",
+            bg=ACCENT_SOFT,
             fg=MUTED,
             font=(FONT, 9),
         ).pack(anchor="w", pady=(4, 0))
@@ -469,7 +651,7 @@ class PracticePanel(tk.Frame):
     def _build_actions(self):
         bar = FlowBar(self)
         self.actions_bar = bar
-        self.actions_bar.grid(row=7, column=0, sticky="ew", pady=(12, 0))
+        self.actions_bar.grid(row=8, column=0, sticky="ew", pady=(12, 0))
 
         self.btn_submit = ttk.Button(bar, text="提交回答", style="Primary.TButton", command=self.submit)
         self.btn_retry = ttk.Button(bar, text="重试分析", style="Primary.TButton", command=self.retry)
@@ -492,7 +674,7 @@ class PracticePanel(tk.Frame):
 
     def _set_banner(self, text: str, kind: str = "info") -> None:
         colors = {"info": MUTED, "error": DANGER, "ok": OK}
-        backgrounds = {"info": BG, "error": "#fdecea", "ok": "#e9f7f0"}
+        backgrounds = {"info": BG, "error": DANGER_SOFT, "ok": OK_SOFT}
         self.banner_var.set(text)
         self.banner_label.configure(fg=colors.get(kind, MUTED), bg=backgrounds.get(kind, BG))
         if text:
@@ -501,15 +683,30 @@ class PracticePanel(tk.Frame):
             self.banner_label.grid_remove()
 
     def _show_result_area(self, show: bool) -> None:
-        if show:
-            self.result_box.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
-            self.rowconfigure(5, weight=3, minsize=110)
-            # 出结果后把输入框收窄一点，让对比结果占更多空间
-            self.answer_text.configure(height=3)
-        else:
-            self.result_box.grid_remove()
-            self.rowconfigure(5, weight=0)
-            self.answer_text.configure(height=5)
+        # 匹配度卡片与结果卡片常驻显示：没提交时给一段提示，避免空白和高度跳动
+        self.score_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        self.result_box.grid(row=6, column=0, sticky="nsew", pady=(10, 0))
+        self.rowconfigure(5, weight=0)
+        self.rowconfigure(6, weight=3, minsize=110)
+        # 出结果后把输入框收窄一点，让对比结果占更多空间
+        self.answer_text.configure(height=3 if show else 5)
+        if not show:
+            self._render_placeholder()
+
+    def _render_placeholder(self) -> None:
+        self.score_var.set("—")
+        self.score_bar.set(0)
+        widget = self.result_text
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("end", "还没有提交\n", "h1")
+        widget.insert(
+            "end",
+            "在上面写下你会说的那句话，点「提交回答」，这里会显示 AI 的对比结果：\n"
+            "你答到了哪些关键意思、漏掉了什么、和标准回复的实质差异，以及标准回复全文。",
+            "muted",
+        )
+        widget.configure(state="disabled")
 
     def _refresh_actions(self):
         buttons = [
@@ -744,43 +941,38 @@ class PracticePanel(tk.Frame):
             return
         analysis = self.analysis
         widget = self.result_text
+        self.score_var.set(f"{analysis['match_score']}%")
+        self.score_bar.set(analysis["match_score"])
         widget.configure(state="normal")
         widget.delete("1.0", "end")
-        widget.insert("end", f"匹配程度  {analysis['match_score']}%\n", "score")
-        widget.insert(
-            "end",
-            "这个百分比只表示「我的回答」与「这张卡的标准回复」的接近程度，不代表对你个人的评价，也不是社交能力评分。\n",
-            "muted",
-        )
-
         widget.insert("end", "我的回答\n", "h1")
         widget.insert("end", f"{(self.attempt or {}).get('user_answer', '')}\n", "body")
 
-        widget.insert("end", "与标准回复意思一致的部分\n", "h1")
+        widget.insert("end", "● 与标准回复意思一致的部分\n", "h1")
         if analysis["matched_points"]:
             for item in analysis["matched_points"]:
-                widget.insert("end", f"· {item}\n", "ok")
+                widget.insert("end", f"✓ {item}\n", "ok")
         else:
-            widget.insert("end", "· （无）\n", "muted")
+            widget.insert("end", "✓ （无）\n", "muted")
 
-        widget.insert("end", "标准回复里你没有表达出来的关键点\n", "h1")
+        widget.insert("end", "● 标准回复里你没有表达出来的关键点\n", "h1")
         if analysis["missing_points"]:
             for item in analysis["missing_points"]:
-                widget.insert("end", f"· {item}\n", "warn")
+                widget.insert("end", f"! {item}\n", "warn")
         else:
-            widget.insert("end", "· （无）\n", "muted")
+            widget.insert("end", "! （无）\n", "muted")
 
-        widget.insert("end", "与标准回复的实质性差异\n", "h1")
+        widget.insert("end", "● 与标准回复的实质性差异\n", "h1")
         if analysis["differences"]:
             for item in analysis["differences"]:
-                widget.insert("end", f"· {item}\n", "diff")
+                widget.insert("end", f"× {item}\n", "diff")
         else:
-            widget.insert("end", "· （无）\n", "muted")
+            widget.insert("end", "× （无）\n", "muted")
 
-        widget.insert("end", "分数依据\n", "h1")
+        widget.insert("end", "● 分数依据\n", "h1")
         widget.insert("end", f"{analysis['explanation']}\n", "body")
 
-        widget.insert("end", "标准回复\n", "h1")
+        widget.insert("end", "● 标准回复\n", "h1")
         widget.insert("end", f"{self.card['back']}\n", "back")
 
         model = (self.attempt or {}).get("analysis_model") or ""
@@ -798,7 +990,7 @@ class PracticePanel(tk.Frame):
             next_record, _ = self.session.preview(self.card["id"], self.grade, self.analysis, self.attempt["id"])
         except Exception as error:  # noqa: BLE001
             self.confirm_var.set(f"无法预览复习计划：{error}")
-            self.confirm_frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+            self.confirm_frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
             return
         self.preview_scheduling = next_record
         self.confirm_var.set(
@@ -806,7 +998,7 @@ class PracticePanel(tk.Frame):
             f"确认后这张卡的下次复习时间将变为 约 {describe_due(next_record['due'], now_ms())}"
             f"（{format_datetime(next_record['due'])}）。"
         )
-        self.confirm_frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        self.confirm_frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
 
 
 
@@ -876,8 +1068,8 @@ class ReviewTab(tk.Frame):
         self.notice_actions = FlowBar(self.notice_inner, bg=CARD_BG)
         self.notice_actions.pack(anchor="w", padx=16, pady=(0, 14))
         self.notice_buttons = [
-            ttk.Button(self.notice_actions, text="去自由练习", command=lambda: self.app.notebook.select(1)),
-            ttk.Button(self.notice_actions, text="查看全部闪卡", command=lambda: self.app.notebook.select(2)),
+            ttk.Button(self.notice_actions, text="去自由练习", command=lambda: self.app.show_page(1)),
+            ttk.Button(self.notice_actions, text="查看全部闪卡", command=lambda: self.app.show_page(2)),
         ]
         self.notice_actions.show(self.notice_buttons)
         self.notice_frame.grid(row=1, column=0, sticky="nsew")
@@ -976,7 +1168,6 @@ class FreeTab(tk.Frame):
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
 
-        tk.Label(left, text="自由练习", bg=BG, fg=TEXT, font=(FONT, 11, "bold")).grid(row=0, column=0, sticky="w")
         tk.Label(
             left,
             text="任意卡片都能练，可以重复练同一张。\n不要求到期，也不会改动复习计划。",
@@ -984,11 +1175,11 @@ class FreeTab(tk.Frame):
             fg=MUTED,
             font=(FONT, 9),
             justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 8))
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         self.search_var = tk.StringVar(value="")
         self.search_var.trace_add("write", lambda *_args: self.reload())
-        ttk.Entry(left, textvariable=self.search_var).grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        ttk.Entry(left, textvariable=self.search_var).grid(row=1, column=0, sticky="ew", pady=(0, 8))
 
         tree_wrap = tk.Frame(left, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
         tree_wrap.grid(row=2, column=0, sticky="nsew")
@@ -1009,7 +1200,7 @@ class FreeTab(tk.Frame):
         self.tree.bind("<Double-1>", lambda _event: self.practice_selected())
 
         buttons = FlowBar(left)
-        buttons.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        buttons.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         buttons.show(
             [
                 ttk.Button(buttons, text="随机抽一张", style="Primary.TButton", command=self.random_card),
@@ -1182,7 +1373,7 @@ class CardsTab(tk.Frame):
         def resize_columns(event):
             """列宽按比例跟着窗口走，窗口拉宽拉窄都不需要手动调整。"""
             total = max(520, event.width - 40)
-            for key, ratio in (("front", 0.33), ("back", 0.31), ("status", 0.09), ("due", 0.19), ("reps", 0.08)):
+            for key, ratio in (("front", 0.32), ("back", 0.30), ("status", 0.09), ("due", 0.20), ("reps", 0.09)):
                 self.tree.column(key, width=max(70, int(total * ratio)))
 
         table.bind("<Configure>", resize_columns, add="+")
@@ -1212,7 +1403,7 @@ class CardsTab(tk.Frame):
         search, card_filter, sort = self._current_query()
         cards = query_cards(self.app.cards, search, card_filter, sort)
         self.tree.delete(*self.tree.get_children())
-        for card in cards:
+        for row_index, card in enumerate(cards):
             status = {"new": "新卡", "due": "已到期", "scheduled": "未到期"}[card["status"]]
             self.tree.insert(
                 "",
@@ -1222,14 +1413,17 @@ class CardsTab(tk.Frame):
                     truncate(card["front"], 60),
                     truncate(card["back"], 60),
                     status,
-                    f"{format_datetime(card['due'])}（{describe_due(card['due'], now_ms())}）",
+                    f"{compact_datetime(card['due'])} · {describe_due(card['due'], now_ms())}",
                     card["formal_reps"],
                 ),
-                tags=(card["status"],),
+                # 斑马纹底色 + 状态颜色：两种标签各自负责背景与文字颜色
+                tags=(f"parity{row_index % 2}", card["status"]),
             )
+        self.tree.tag_configure("parity0", background=CARD_BG)
+        self.tree.tag_configure("parity1", background="#f6f7fb")
         self.tree.tag_configure("new", foreground=ACCENT_DARK)
         self.tree.tag_configure("due", foreground=WARN)
-        self.tree.tag_configure("scheduled", foreground=MUTED)
+        self.tree.tag_configure("scheduled", foreground="#4a4d55")
         self.count_var.set(f"共 {len(self.app.cards)} 张卡片，当前显示 {len(cards)} 张。双击一行可以直接编辑。")
 
     def _selected_card(self):
@@ -1351,26 +1545,32 @@ class CardEditorDialog(tk.Toplevel):
         self.app = app
         self.card = card
         self.title("编辑卡片" if card else "新建卡片")
-        self.configure(bg=BG)
+        self.configure(bg=CARD_BG)
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill="both", expand=True, padx=16, pady=14)
+        body = tk.Frame(self, bg=CARD_BG)
+        body.pack(fill="both", expand=True, padx=18, pady=16)
 
-        tk.Label(body, text="正面（情境 / 问题）", bg=BG, fg=MUTED, font=(FONT, 9)).pack(anchor="w")
-        self.front_text = tk.Text(body, height=4, wrap="word", font=(FONT, 11), bg=CARD_BG, relief="solid", borderwidth=1, padx=8, pady=6)
+        tk.Label(body, text="正面（情境 / 问题）", bg=CARD_BG, fg=MUTED, font=(FONT, 9)).pack(anchor="w")
+        self.front_text = tk.Text(
+            body, height=4, wrap="word", font=(FONT, 11), bg=CARD_BG, relief="flat",
+            highlightthickness=1, highlightbackground=BORDER_STRONG, highlightcolor=ACCENT, padx=10, pady=8,
+        )
         self.front_text.pack(fill="x", pady=(4, 12))
 
-        tk.Label(body, text="背面（标准回复）", bg=BG, fg=MUTED, font=(FONT, 9)).pack(anchor="w")
-        self.back_text = tk.Text(body, height=6, wrap="word", font=(FONT, 11), bg=CARD_BG, relief="solid", borderwidth=1, padx=8, pady=6)
+        tk.Label(body, text="背面（标准回复）", bg=CARD_BG, fg=MUTED, font=(FONT, 9)).pack(anchor="w")
+        self.back_text = tk.Text(
+            body, height=7, wrap="word", font=(FONT, 11), bg=CARD_BG, relief="flat",
+            highlightthickness=1, highlightbackground=BORDER_STRONG, highlightcolor=ACCENT, padx=10, pady=8,
+        )
         self.back_text.pack(fill="both", expand=True, pady=(4, 8))
 
         self.hint_label = tk.Label(
             body,
             text="修改标准回复只影响卡面内容，不会重置这张卡的 FSRS 复习历史与下次复习时间。",
-            bg=BG,
+            bg=CARD_BG,
             fg=MUTED,
             font=(FONT, 9),
             justify="left",
@@ -1380,9 +1580,9 @@ class CardEditorDialog(tk.Toplevel):
         adaptive_wrap(self.hint_label, body, 30)
 
         self.error_var = tk.StringVar(value="")
-        tk.Label(body, textvariable=self.error_var, bg=BG, fg=DANGER, font=(FONT, 9)).pack(anchor="w", pady=(6, 0))
+        tk.Label(body, textvariable=self.error_var, bg=CARD_BG, fg=DANGER, font=(FONT, 9)).pack(anchor="w", pady=(6, 0))
 
-        actions = tk.Frame(body, bg=BG)
+        actions = tk.Frame(body, bg=CARD_BG)
         actions.pack(fill="x", pady=(10, 0))
         ttk.Button(actions, text="保存", style="Primary.TButton", command=self.save).pack(side="right")
         ttk.Button(actions, text="取消", command=self.destroy).pack(side="right", padx=(0, 8))
